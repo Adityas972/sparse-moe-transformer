@@ -126,4 +126,29 @@ python ablation.py --skip_training    # just re-plot existing runs under checkpo
 Trains two MoE models identically (same seed, same `z_loss_weight=0.001`) except `aux_loss_weight`:
 `0.0` vs `0.01`. Produces `expert_utilization_ablation.png` (final per-expert selection fraction,
 side by side, with a dashed line at the ideal uniform `1/8`) and `expert_utilization_spread_over_time.png`
-(max-min utilization gap across training, for both runs).
+(max-min utilization gap across training, for both runs). Both are gitignored (regenerate with
+`python ablation.py`) since they're fully reproducible from code + a fixed seed, same as checkpoints/logs.
+
+### Result
+
+| | no aux loss (0.0) | with aux loss (0.01) |
+|---|---|---|
+| final utilization | `[.085,.125,.095,.109,.109,.168,.131,.177]` | `[.130,.117,.115,.129,.131,.129,.113,.136]` |
+| max-min spread | 0.092 | **0.023** (~4x tighter) |
+| val perplexity | 5.57 | 5.75 |
+
+The load-balancing loss does exactly what it's supposed to: expert selection goes from visibly skewed
+(experts 5/7 getting ~2x expert 0's traffic, stable that way for the rest of training) to close to
+uniform, and stays there from step ~250 onward (`expert_utilization_spread_over_time.png` shows both
+runs converge fast, but only the balanced one converges *down* near zero rather than to a stable ~0.09
+plateau).
+
+Worth being honest about: **validation perplexity is very slightly worse with load balancing** on this
+tiny dataset (5.75 vs 5.57). That's a real, expected result, not a bug -- forcing uniform routing is a
+constraint that can trade a small amount of raw fit for utilization fairness, and at this scale
+(1M-character dataset, 8 experts) there isn't enough data for the extra balanced capacity to pay for
+itself in perplexity. The practical case for load balancing isn't "always lowers loss" -- it's avoiding
+*expert collapse* (a few experts starving, useful capacity going permanently unused, and in a real
+multi-GPU deployment, catastrophic compute imbalance across devices). On top-2 routing at this scale,
+collapse showed up as a persistent ~2x skew rather than experts going to ~0 -- full collapse is more
+dramatic with top-1 routing and/or a larger model trained longer.
