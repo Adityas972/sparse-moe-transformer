@@ -7,3 +7,4 @@ data/meta.pkl
 checkpoints/
 logs/
 *.png
+!assets/*.png

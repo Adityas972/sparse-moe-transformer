@@ -1,154 +1,178 @@
 # Sparse MoE Transformer, from scratch
 
-A small decoder-only GPT-style transformer built up incrementally:
+I wanted to actually understand how Mixture-of-Experts transformers work -- not "I called
+`num_experts=8` in a config file," but "I know why the router loss is shaped the way it is
+because I derived it and then watched it fix a real problem I created." So this is a small
+GPT built up in four stages, each one runnable and checkable on its own before moving to the
+next:
 
-1. **Dense baseline** -- causal self-attention with RoPE, pre-RMSNorm, dense FFN. (done)
-2. **Sparse MoE layer** -- replace the FFN with 8 experts, top-2 routing. (done)
-3. **Load balancing** -- Switch-style auxiliary loss + router z-loss, expert utilization logging. (done)
-4. **Ablation** -- train with/without the load-balancing loss and compare expert utilization histograms.
+1. A normal dense decoder-only transformer (RoPE, pre-RMSNorm, causal attention) -- train it,
+   generate from it, make sure the foundation actually works.
+2. Rip out the FFN and replace it with 8 experts and top-2 routing. No fancy loss yet -- just
+   "does routing work at all."
+3. Add the load-balancing loss and router z-loss that MoE papers always mention and rarely
+   show you the effect of.
+4. Actually run the "with vs. without" comparison and look at the histograms, instead of
+   taking it on faith that load balancing matters.
 
-## Setup
+Everything below is real output from runs on my own machine (a Mac, using the MPS backend),
+not made-up numbers.
+
+## Quickstart
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python data/prepare_data.py   # downloads TinyShakespeare, builds char-level train/val .bin files
-```
+python data/prepare_data.py                                        # grabs TinyShakespeare, builds char vocab
 
-## Step 1: dense baseline
-
-```bash
-python train.py                                    # ~3000 steps, a few minutes on CPU
+python train.py                                                    # Step 1: dense baseline
 python generate.py --ckpt checkpoints/dense/ckpt.pt --prompt "ROMEO:"
+
+python train.py --use_moe --aux_loss_weight 0.01                   # Step 2+3: MoE, load-balanced
+python ablation.py                                                  # Step 4: the actual comparison
 ```
 
-### Design choices
+## Step 1 -- does the base transformer even work?
 
-- **Tokenizer: character-level**, not BPE. Tradeoff explained in `data/prepare_data.py`'s docstring --
-  short version: zero extra dependencies/moving parts, tiny vocab, at the cost of ~4x longer sequences
-  for the same text. This project is about attention/RoPE/MoE internals, not tokenization, so the
-  simplest tokenizer that works was the right call.
-- **RoPE, not learned positional embeddings** -- applied inside attention to q/k only (`model/rope.py`).
-- **Pre-RMSNorm** -- `x = x + Sublayer(RMSNorm(x))`, the modern default (LLaMA/PaLM-style) over the
-  original post-norm Transformer, because it keeps the residual stream well-behaved at depth.
-- **Weight tying** between the token embedding and the output (`lm_head`) projection.
-- Manual (not fused) attention implementation in `model/attention.py`, for readability over speed --
-  at this scale (d_model=256, context_length=128) the difference is not noticeable.
+Nothing exotic here: fused QKV attention, RoPE applied to q/k inside attention (not a separate
+positional embedding table), pre-RMSNorm residual blocks, weight tying between the embedding
+and output head. I wrote attention manually rather than calling
+`F.scaled_dot_product_attention`, purely because I wanted every step -- the mask, the softmax,
+the scaling -- visible while I was building this, not hidden in a fused kernel.
 
-### Project layout
+One tokenizer decision worth calling out: I went **character-level**, not BPE. TinyShakespeare
+is small, the point of this project is the MoE layer and not the tokenizer, and char-level
+means zero extra moving parts (no merge tables, no external dependency) at the cost of ~4x
+longer sequences for the same text. Full tradeoff reasoning is in `data/prepare_data.py`'s
+docstring if you want it.
+
+**Did it work?** 4.74M params, 3000 steps, ~7 minutes. Val loss bottomed at **1.49** (perplexity
+~4.5) before it started mildly overfitting -- expected on a dataset this small. And it actually
+writes Shakespeare-shaped text:
+
+> ROMEO:\
+> What entent'st thou must not choosing the other.
+>
+> GLOUCESTER:\
+> What, with you? that was your worshipful witch?
+
+Good enough to trust the foundation and move on.
+
+## Step 2 -- swap the FFN for 8 experts, top-2 routing
+
+`model/moe.py` replaces the dense FFN with a router (`Linear(d_model, 8)`) and 8 smaller
+copies of the same FFN shape. Each token's top-2 experts get computed, weighted by their
+(renormalized) router softmax scores, and combined. No capacity limit -- every token's chosen
+experts always run, however many other tokens picked the same ones. At this scale that's the
+right call: capacity-based token dropping (real Switch Transformer behavior) adds a fair
+amount of masking complexity for zero compute benefit when your model has 14M parameters.
+
+I sized each expert at `expert_d_ff=512`, half the dense FFN's width, on purpose: with top-2
+of 8 experts active, a token's *active* compute per forward pass lands in the same ballpark as
+Step 1's dense FFN, even though the *total* parameter count is ~4x bigger. That gap between
+"active compute" and "total capacity" is the entire premise of MoE.
+
+**Did it work?** Yes, but not for free. 14.19M params, same 3000 steps. Val loss actually came
+in slightly *worse* than the dense model (1.53 vs 1.49) -- with way more capacity and nothing
+telling the router to spread load, it just overfits the small training set harder (train loss
+hit 0.87 vs. dense's 1.07). And sure enough, expert usage settled into a stable, uneven pattern
+almost immediately and never recovered: `[0.09, 0.13, 0.11, 0.10, 0.11, 0.17, 0.12, 0.16]`
+against an ideal of 0.125 each. Experts 5 and 7 were doing ~1.8x expert 0's work, for the whole
+rest of training. That's the exact motivation for Step 3, not a hypothetical one.
+
+## Step 3 -- the load-balancing loss + router z-loss
+
+Two terms, added in `model/moe.py::compute_aux_losses`, computed per MoE layer and then
+averaged across layers (a well-balanced layer shouldn't be able to statistically cover for a
+badly imbalanced one):
+
+- **Load-balancing loss**, generalized from Switch Transformer's top-1 formula to top-k: for
+  each expert, take `f_e` (fraction of tokens that picked it -- a hard, non-differentiable
+  count from the actual routing decision) times `P_e` (the router's average softmax
+  probability on it -- differentiable), sum over experts, scale by `n_experts`. Since `f_e`
+  carries no gradient, all the pressure flows through `P_e`: minimizing this loss pushes the
+  router's probability *down* on experts that are already getting picked too often.
+- **Router z-loss** (from the ST-MoE paper): `mean(logsumexp(router_logits)²)`. Keeps the
+  router's logits from growing unbounded, which would otherwise make routing more and more
+  overconfident and actively fight the balancing loss.
+
+Before trusting any training curve, I checked both formulas against what they should equal at
+initialization, when the router is basically random/uniform: `aux_loss` came out to `2.2022`
+against a theoretical minimum of exactly `2.0` for top_k=2, and `z_loss` came out to `4.6755`
+against `log(8)² ≈ 4.32`. Close enough on both to trust the implementation before looking at
+anything downstream.
+
+## Step 4 -- does it actually fix anything?
+
+This is the part that made the whole exercise worth it. Two identical runs -- same seed, same
+`z_loss_weight=0.001`, same everything -- except `aux_loss_weight`: `0.0` vs `0.01`.
+
+<p align="center">
+  <img src="assets/expert_utilization_ablation.png" alt="Expert utilization with vs without load balancing" width="850">
+</p>
+
+| | no balancing (0.0) | balanced (0.01) |
+|---|---|---|
+| final expert utilization | `[.085, .125, .095, .109, .109, .168, .131, .177]` | `[.130, .117, .115, .129, .131, .129, .113, .136]` |
+| max-min spread | 0.092 | **0.023** -- about 4x tighter |
+| val perplexity | 5.57 | 5.75 |
+
+<p align="center">
+  <img src="assets/expert_utilization_spread_over_time.png" alt="Expert utilization imbalance over training" width="650">
+</p>
+
+The unbalanced run's imbalance shows up almost immediately and then just... stays, for all
+3000 steps. The balanced run converges to close-to-uniform by step ~250 and holds it. That's
+the whole point of the loss, working exactly as advertised.
+
+**The part I want to be upfront about:** the balanced run's validation perplexity is very
+slightly *worse* (5.75 vs. 5.57). That's a genuine result, not a mistake I'm hand-waving away
+-- forcing routing toward uniform is a constraint, and on a dataset this small (1M characters,
+8 experts) there just isn't enough data for the balanced capacity to earn back that constraint
+in raw perplexity. The real-world case for load balancing was never "it always lowers loss" --
+it's avoiding *expert collapse*: capacity going permanently unused, and in an actual
+multi-GPU deployment, some devices sitting idle while others bottleneck. At this scale, with
+top-2 (not top-1) routing, "collapse" looked like a persistent ~2x skew rather than experts
+dropping to near-zero -- I'd expect a sharper collapse with top-1 routing or a longer run on a
+bigger model.
+
+## Design decisions, and why
+
+- **Character-level tokenizer** over BPE -- see Step 1 above / `data/prepare_data.py`.
+- **RoPE, not learned position embeddings** -- applied to q/k inside attention (`model/rope.py`).
+- **Pre-RMSNorm** (`x = x + Sublayer(RMSNorm(x))`) over the original post-norm Transformer --
+  keeps the residual stream well-behaved as depth increases; it's what LLaMA/PaLM-style models
+  do now instead of GPT-2's original recipe.
+- **No expert capacity limit / token dropping** -- simpler, and at this scale there's no compute
+  reason to add it. See Step 2.
+- **Weight tying** between the token embedding and the LM head, standard since GPT-2.
+
+## Repo layout
 
 ```
 model/
-  config.py     GPTConfig dataclass (all model hyperparameters, including not-yet-used MoE fields)
-  rope.py       Rotary positional embeddings
+  config.py     one dataclass for every hyperparameter (base model + MoE, from the start)
+  rope.py       rotary position embeddings
   norm.py       RMSNorm
-  attention.py  Causal multi-head self-attention w/ RoPE
-  mlp.py        Dense 2-layer FFN (Step 1's FFN; also the shape each MoE expert takes in Step 2)
-  block.py      One transformer block (pre-norm attn + FFN)
-  gpt.py        Full model: embedding -> blocks -> norm -> head, plus .generate()
+  attention.py  causal multi-head self-attention w/ RoPE, written out by hand
+  mlp.py        the dense 2-layer FFN (Step 1's FFN, and the shape each expert takes)
+  moe.py        the MoE layer + the load-balancing/z-loss math (Steps 2-3)
+  block.py      one transformer block (pre-norm attn + FFN/MoE)
+  gpt.py        embedding -> blocks -> norm -> head, plus .generate()
 data/
-  prepare_data.py   Downloads + tokenizes TinyShakespeare
+  prepare_data.py   downloads + tokenizes TinyShakespeare
 utils/
-  scheduler.py  Cosine LR schedule with linear warmup
-train.py        Training loop (CLI flags already include the Step 2/3 MoE knobs, unused until then)
-generate.py     Sample text from a checkpoint
+  scheduler.py  cosine LR schedule with linear warmup
+train.py        training loop for both dense and MoE models
+generate.py     sample text from a checkpoint
+ablation.py     Step 4: runs both configs, plots the comparison
 ```
 
-## Default hyperparameters (CPU-friendly)
+## If I kept going
 
-`n_layers=6, n_heads=4, d_model=256, d_ff=1024, context_length=128, batch_size=64, max_steps=3000`
--- picked to finish a full training run in a few minutes on a laptop CPU while still producing
-recognizable structure in generated text.
-
-## Step 2: sparse MoE, top-2 routing, no load balancing yet
-
-```bash
-python train.py --use_moe --out_dir checkpoints/moe_no_aux
-python generate.py --ckpt checkpoints/moe_no_aux/ckpt.pt --prompt "ROMEO:"
-```
-
-`model/moe.py` adds `MoEFeedForward`: a router (`Linear(d_model, n_experts)`) plus 8 independent
-copies of the Step 1 `MLP` (each sized `expert_d_ff=512`, half the dense FFN's width -- see the
-comment in `moe.py` on why: top_k=2 of 8 experts means active FFN compute per token stays roughly
-matched to Step 1's dense FFN, even though total *parameters* are ~4x larger). No capacity limit --
-every token is computed by its chosen top-2 experts, whichever they are, and their outputs are
-combined by their (renormalized) router softmax weights.
-
-`Block`/`GPT` now thread router logits through the model (`GPT.forward` returns
-`(logits, loss, router_logits_list)`) so Step 3 can compute the load-balancing/z-loss from them --
-Step 2 doesn't use them for anything yet except utilization logging in `train.py`.
-
-**Result (3000 steps, no aux loss):** 14.19M params (vs. dense's 4.74M). Val loss bottoms at **1.53**
-(ppl 4.62) around step 1250 -- slightly worse than the dense baseline's 1.49, because with no
-load-balancing pressure and much more capacity, the MoE model overfits the small training set harder
-(train loss reaches 0.87 vs dense's 1.07). Expert utilization stabilizes early and stays uneven for
-the rest of training: `[0.09, 0.13, 0.11, 0.10, 0.11, 0.17, 0.12, 0.16]` (ideal balanced = 0.125 each)
--- experts 5 and 7 consistently get ~1.8x the traffic of expert 0. This is the baseline Step 4's
-ablation will compare against.
-
-## Step 3: load-balancing loss + router z-loss
-
-```bash
-python train.py --use_moe --aux_loss_weight 0.01 --out_dir checkpoints/moe_with_aux
-```
-
-`model/moe.py::compute_aux_losses` adds two terms, computed per MoE layer from that layer's
-`router_logits` and then averaged across layers:
-
-- **Load-balancing loss** (Switch Transformer, generalized top-1 -> top-k): for each expert `e`,
-  `f_e` = fraction of tokens with `e` among their top-k picks (hard, non-differentiable), `P_e` =
-  average router softmax probability on `e` (differentiable). `aux_loss = n_experts * sum_e(f_e * P_e)`.
-  Gradient only flows through `P_e`, so minimizing this pushes down the router's probability on
-  experts that are already over-selected. At perfect uniform routing this evaluates to `top_k` (not
-  `1` as in the original top-1 paper -- the scaling constant carries over but the "balanced" value
-  shifts with top_k; what matters is it's still minimized at uniform routing).
-- **Router z-loss** (ST-MoE): `mean(logsumexp(router_logits)^2)`, keeps router logits from growing
-  unbounded (which would otherwise make routing increasingly overconfident and fight the balancing
-  loss). Used at its always-on recommended coefficient, `z_loss_weight=0.001`, in every MoE run from
-  here on -- only `aux_loss_weight` is the ablation variable in Step 4.
-
-Sanity check at initialization (random router, effectively uniform): `aux_loss=2.2022` (theoretical
-minimum for top_k=2 is exactly 2.0) and `z_loss=4.6755` (`log(8)^2 ≈ 4.32` for near-zero logits over
-8 experts) -- both match theory closely, confirming the formulas are implemented correctly before
-looking at any training curves.
-
-Total loss is now `cross_entropy + aux_loss_weight * aux_loss + z_loss_weight * z_loss`; all three
-components are logged separately (console + `train_log.jsonl`) specifically so they can be compared
-across the Step 4 ablation.
-
-## Step 4: ablation (with vs. without load balancing)
-
-```bash
-python ablation.py                    # trains both configs (~15 min each on MPS), then plots
-python ablation.py --skip_training    # just re-plot existing runs under checkpoints/ablation_*
-```
-
-Trains two MoE models identically (same seed, same `z_loss_weight=0.001`) except `aux_loss_weight`:
-`0.0` vs `0.01`. Produces `expert_utilization_ablation.png` (final per-expert selection fraction,
-side by side, with a dashed line at the ideal uniform `1/8`) and `expert_utilization_spread_over_time.png`
-(max-min utilization gap across training, for both runs). Both are gitignored (regenerate with
-`python ablation.py`) since they're fully reproducible from code + a fixed seed, same as checkpoints/logs.
-
-### Result
-
-| | no aux loss (0.0) | with aux loss (0.01) |
-|---|---|---|
-| final utilization | `[.085,.125,.095,.109,.109,.168,.131,.177]` | `[.130,.117,.115,.129,.131,.129,.113,.136]` |
-| max-min spread | 0.092 | **0.023** (~4x tighter) |
-| val perplexity | 5.57 | 5.75 |
-
-The load-balancing loss does exactly what it's supposed to: expert selection goes from visibly skewed
-(experts 5/7 getting ~2x expert 0's traffic, stable that way for the rest of training) to close to
-uniform, and stays there from step ~250 onward (`expert_utilization_spread_over_time.png` shows both
-runs converge fast, but only the balanced one converges *down* near zero rather than to a stable ~0.09
-plateau).
-
-Worth being honest about: **validation perplexity is very slightly worse with load balancing** on this
-tiny dataset (5.75 vs 5.57). That's a real, expected result, not a bug -- forcing uniform routing is a
-constraint that can trade a small amount of raw fit for utilization fairness, and at this scale
-(1M-character dataset, 8 experts) there isn't enough data for the extra balanced capacity to pay for
-itself in perplexity. The practical case for load balancing isn't "always lowers loss" -- it's avoiding
-*expert collapse* (a few experts starving, useful capacity going permanently unused, and in a real
-multi-GPU deployment, catastrophic compute imbalance across devices). On top-2 routing at this scale,
-collapse showed up as a persistent ~2x skew rather than experts going to ~0 -- full collapse is more
-dramatic with top-1 routing and/or a larger model trained longer.
+- Expert-capacity-based token dropping, to see actual Switch-style collapse (all the way to
+  near-zero utilization) rather than the milder skew top-2 routing produces here.
+- A real subword tokenizer, to see whether the load-balancing story changes once sequences
+  carry more information per token.
+- Scaling up (`d_model`, `n_layers`, dataset size) to see whether the perplexity gap in Step 4
+  closes, stays flat, or reverses -- my guess is it closes, but I haven't run it.
