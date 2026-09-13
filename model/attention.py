@@ -15,8 +15,7 @@ class CausalSelfAttention(nn.Module):
         self.n_heads = config.n_heads
         self.head_dim = config.d_model // config.n_heads
 
-        # One fused linear for Q, K, V instead of three separate ones -- pure
-        # efficiency (one matmul instead of three), no behavioral difference.
+        # One fused linear for Q, K, V instead of three separate ones, just fewer kernel launches.
         self.qkv_proj = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
         self.out_proj = nn.Linear(config.d_model, config.d_model, bias=False)
         self.attn_dropout = nn.Dropout(config.dropout)
@@ -46,14 +45,13 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
-        # Rotate q and k by position (see rope.py) -- v is left un-rotated,
-        # since RoPE only needs to affect the q.k similarity scores.
+        # Rotate q and k by position (see rope.py). v stays as-is; RoPE only needs to affect q.k scores.
         cos, sin = self.rope_cos[:T], self.rope_sin[:T]
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
 
         # Scaled dot-product attention, computed manually (rather than via
-        # F.scaled_dot_product_attention) so every step is visible:
+        # F.scaled_dot_product_attention) so every step is visible.
         attn_scores = q @ k.transpose(-2, -1) / math.sqrt(self.head_dim)  # (B, n_heads, T, T)
         attn_scores = attn_scores.masked_fill(~self.causal_mask[:T, :T], float("-inf"))
         attn_weights = F.softmax(attn_scores, dim=-1)

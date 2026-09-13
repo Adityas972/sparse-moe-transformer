@@ -1,11 +1,5 @@
-"""
-The dense feed-forward block used when config.use_moe=False (Step 1).
-
-In Step 2 this gets replaced per-block by a sparse MoE layer built out of
-several smaller copies of this same 2-layer shape (see model/moe.py) -- so
-this class doubles as both "the Step 1 FFN" and "the shape a single expert
-takes."
-"""
+"""The dense feed-forward block (used when config.use_moe=False). Also the
+shape each MoE expert takes in model/moe.py, just narrower."""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

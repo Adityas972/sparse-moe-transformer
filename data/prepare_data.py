@@ -1,33 +1,10 @@
-"""
-Downloads TinyShakespeare and prepares it as a character-level dataset.
-
-Tokenizer choice -- character-level vs. BPE:
-  This project uses a character-level tokenizer (vocab_size ~65: the letters,
-  punctuation, and whitespace that actually appear in the text). The
-  tradeoff versus a BPE/subword tokenizer:
-
-    - Character-level: trivial to implement (no tokenizer training, no
-      external dependency), tiny vocab (cheap embedding/output matrices,
-      which matters when d_model=256), and every possible input is
-      representable. The cost is that sequences are ~4x longer for the same
-      text (average English word/token ratio), so the model has to spend
-      capacity learning spelling and basic word structure before it can get
-      to anything higher-level, and needs a larger context_length to "see"
-      the same amount of text a subword tokenizer would fit in fewer tokens.
-    - BPE/subword: much shorter sequences for the same text (GPT-2's BPE
-      gets ~4 chars/token), so the model reaches word- and phrase-level
-      patterns faster per training step, and context_length covers more
-      actual content. The cost is a whole extra pipeline (training or
-      loading a merge table, handling of unknown byte sequences) that adds
-      moving parts to a project whose actual point is the MoE layer, not
-      tokenization.
-
-  For a small, fast-iterating educational run, character-level keeps the
-  moving parts down to exactly the ones this project is about (attention,
-  RoPE, MoE routing) -- so that's what's implemented here. Swapping in a BPE
-  tokenizer later would only require changing this file and reading
-  meta.pkl's vocab_size in train.py; nothing else in the model depends on
-  the tokenization scheme.
+"""Downloads TinyShakespeare and tokenizes it at the character level
+(vocab_size ~65). Went with char-level over BPE mainly for simplicity - no
+merge table to train/load, no extra dependency, and this project is about
+the attention/MoE internals, not the tokenizer. Costs ~4x longer sequences
+for the same text vs. a subword tokenizer, which matters less at this
+scale than the reduced moving parts do. Swapping in BPE later would only
+touch this file plus meta.pkl's vocab_size in train.py.
 """
 import os
 import pickle

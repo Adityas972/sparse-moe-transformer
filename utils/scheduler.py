@@ -1,11 +1,7 @@
-"""Linear warmup followed by cosine decay -- the standard GPT-training LR schedule.
-
-Warmup avoids a large, noisy first gradient step destabilizing training
-before the Adam moment estimates have "warmed up". Cosine decay (rather than
-a fixed LR, or step decay) smoothly reduces the LR over training, which
-empirically gives lower final loss than either alternative for this kind of
-model.
-"""
+"""Linear warmup + cosine decay, the standard GPT training LR schedule.
+Warmup avoids a noisy first gradient step before Adam's moment estimates
+settle; cosine decay tends to beat a fixed LR or step decay for this kind
+of model."""
 import math
 
 

@@ -1,11 +1,6 @@
-"""
-Single config dataclass for the whole model. Steps 2-3 add MoE fields here;
-Step 1 only uses the base fields (use_moe stays False so each Block builds a
-plain dense FFN instead of an MoE layer -- see model/block.py).
-
-Keeping every field in one place from the start means Block/GPT never need
-to be rewritten later, just toggled.
-"""
+"""One config dataclass for the whole model, base transformer + MoE fields
+together. use_moe just toggles whether Block builds a dense FFN or an MoE
+layer (model/block.py); nothing else needs to change when you flip it."""
 from dataclasses import dataclass
 
 
@@ -23,13 +18,13 @@ class GPTConfig:
     dropout: float = 0.0
     rope_theta: float = 10000.0  # RoPE base frequency, 10000 is the original/standard choice
 
-    # --- MoE (Step 2+) ---
+    # --- MoE ---
     use_moe: bool = False
     n_experts: int = 8
     top_k: int = 2
-    expert_d_ff: int = 512  # each expert is smaller than the dense FFN -- see Step 2 notes
-    aux_loss_weight: float = 0.0  # load-balancing loss coefficient (Step 3)
-    z_loss_weight: float = 0.0  # router z-loss coefficient (Step 3)
+    expert_d_ff: int = 512  # narrower than the dense FFN, see model/moe.py
+    aux_loss_weight: float = 0.0  # load-balancing loss coefficient
+    z_loss_weight: float = 0.0  # router z-loss coefficient
 
     def __post_init__(self):
         assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"

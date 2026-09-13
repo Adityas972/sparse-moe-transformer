@@ -1,11 +1,9 @@
 """
-Step 4: runs the load-balancing ablation and plots the result.
+Runs the load-balancing ablation and plots the result.
 
-Trains two identical MoE models -- same seed, same everything -- except
-aux_loss_weight (0.0 vs 0.01). z_loss_weight is held constant across both
-runs so the only thing that differs is the load-balancing term itself; if it
-varied too, a difference in the resulting histograms couldn't be
-attributed to aux_loss_weight specifically.
+Trains two identical MoE models, same seed and same everything else, except
+aux_loss_weight (0.0 vs 0.01). z_loss_weight is held constant across both so
+the only variable is the load-balancing term itself.
 
 Usage:
     python ablation.py                       # runs both trainings, then plots
@@ -67,7 +65,7 @@ def main():
     n_experts = len(util_no_aux)
     ideal = 1.0 / n_experts
 
-    # --- Plot 1: final utilization histograms, side by side ---
+    # final utilization histograms, side by side
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.5), sharey=True)
     for ax, util, title in zip(
         axes,
@@ -86,7 +84,7 @@ def main():
     fig.savefig("expert_utilization_ablation.png", dpi=150)
     print("Saved expert_utilization_ablation.png")
 
-    # --- Plot 2 (bonus): imbalance (max-min utilization) over training ---
+    # imbalance (max-min utilization) over training
     fig2, ax2 = plt.subplots(figsize=(7, 4.5))
     for log, label, color in [(log_no_aux, "aux_loss_weight = 0.0", "#c44e52"), (log_with_aux, "aux_loss_weight = 0.01", "#55a868")]:
         entries = [e for e in log if "expert_utilization" in e]

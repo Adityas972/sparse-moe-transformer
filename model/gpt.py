@@ -1,10 +1,9 @@
-"""
-The full decoder-only GPT model: token embedding -> N transformer blocks ->
-final norm -> output head.
+"""The full decoder-only GPT model: token embedding -> N transformer blocks
+-> final norm -> output head.
 
-Note there's no separate learned/sinusoidal positional embedding table here
--- position information comes entirely from RoPE inside each attention
-layer (see rope.py). The token embedding only encodes *what* token it is.
+No separate positional embedding table - position comes entirely from RoPE
+inside attention (rope.py). The token embedding only encodes *what* token
+it is.
 """
 import math
 
@@ -27,20 +26,12 @@ class GPT(nn.Module):
         self.final_norm = RMSNorm(config.d_model)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
-        # Weight tying: the input embedding and output projection share the
-        # same matrix. This is standard in GPT-2 and onward -- it roughly
-        # halves the parameters spent on the vocab, and empirically doesn't
-        # hurt (arguably helps) quality, since both matrices are learning a
-        # similar "token <-> d_model vector" mapping.
+        # weight tying: embedding and output projection share one matrix (GPT-2 onward)
         self.lm_head.weight = self.token_emb.weight
 
         self.apply(self._init_weights)
-        # Scale down the output projection of each residual sublayer
-        # (attention's out_proj, FFN's fc_out) by 1/sqrt(2 * n_layers).
-        # Without this, the variance of the residual stream grows with depth
-        # (each of the 2*n_layers sublayers adds independent variance to the
-        # same stream); this keeps activations well-scaled at initialization
-        # regardless of how many layers are stacked. Same trick as GPT-2.
+        # scale down residual-sublayer output projections by 1/sqrt(2*n_layers),
+        # otherwise activation variance grows with depth (GPT-2's init trick)
         for name, p in self.named_parameters():
             if name.endswith("out_proj.weight") or name.endswith("fc_out.weight"):
                 nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layers))
@@ -54,16 +45,11 @@ class GPT(nn.Module):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
-        """
-        idx: (B, T) token ids
-        targets: (B, T) token ids shifted by one, or None for inference.
-        Returns (logits, loss, router_logits_list):
-          - loss is None if targets is None.
-          - router_logits_list is a list of (B*T, n_experts) tensors, one per
-            MoE block (empty list if config.use_moe is False). Step 1 code
-            calling this can just ignore the third return value; Step 3 uses
-            it to compute the load-balancing and z-losses.
-        """
+        """idx, targets: (B, T) token ids, targets shifted by one (or None for inference).
+        Returns (logits, loss, router_logits_list) - loss is None if targets is
+        None; router_logits_list has one (B*T, n_experts) tensor per MoE block,
+        empty if config.use_moe is False. Used by compute_aux_losses() for the
+        load-balancing/z-loss."""
         x = self.token_emb(idx)  # (B, T, d_model)
         router_logits_list = []
         for block in self.blocks:

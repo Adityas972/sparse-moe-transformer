@@ -2,22 +2,20 @@
 Training script: dense GPT (default) or sparse MoE GPT (--use_moe) on
 character-level TinyShakespeare.
 
-Defaults are chosen to be comfortable on a laptop CPU/MPS: context_length=128,
-batch_size=64, 3000 steps finishes in a few minutes and already produces
-recognizably-Shakespeare-ish character sequences.
+Defaults are sized for a laptop CPU/MPS: context_length=128, batch_size=64,
+3000 steps finishes in a few minutes and already produces recognizably
+Shakespeare-ish text.
 
 Usage:
     python data/prepare_data.py     # one-time: download + tokenize
-    python train.py                                                     # Step 1: dense baseline
-    python train.py --use_moe --aux_loss_weight 0.0  --out_dir checkpoints/moe_no_aux   # Step 2 behavior
-    python train.py --use_moe --aux_loss_weight 0.01 --out_dir checkpoints/moe_with_aux # Step 3: load-balanced
+    python train.py
+    python train.py --use_moe --aux_loss_weight 0.0  --out_dir checkpoints/moe_no_aux
+    python train.py --use_moe --aux_loss_weight 0.01 --out_dir checkpoints/moe_with_aux
 
-When --use_moe is set, the total loss is:
-    loss = cross_entropy + aux_loss_weight * aux_loss + z_loss_weight * z_loss
-(aux_loss and z_loss are computed in model/moe.py::compute_aux_losses). All
-three components are logged separately -- see the printed eval lines and
-train_log.jsonl -- specifically so aux_loss_weight=0 vs 0.01 runs can be
-compared (that's Step 4, ablation.py).
+With --use_moe, total loss = cross_entropy + aux_loss_weight * aux_loss +
+z_loss_weight * z_loss (see model/moe.py::compute_aux_losses). All three
+are logged separately so the two aux_loss_weight settings can be compared
+(ablation.py does exactly that).
 """
 import argparse
 import json
@@ -44,9 +42,7 @@ def parse_args():
     p.add_argument("--d_ff", type=int, default=1024)
     p.add_argument("--context_length", type=int, default=128)
     p.add_argument("--dropout", type=float, default=0.0)
-    # MoE (unused until Step 2/3 wire them into the model; accepted here
-    # already so later steps -- and the Step 4 ablation script -- don't need
-    # to change this file's CLI surface)
+    # MoE
     p.add_argument("--use_moe", action="store_true")
     p.add_argument("--n_experts", type=int, default=8)
     p.add_argument("--top_k", type=int, default=2)
@@ -81,11 +77,8 @@ def get_device(requested: str | None) -> str:
 
 
 def make_batch_getter(context_length: int, batch_size: int, device: str):
-    # np.memmap avoids loading the whole (tiny, but let's be consistent with
-    # how you'd do this for a real dataset) file into RAM up front; re-opened
-    # each call because memmap + multiprocessing/forking doesn't always play
-    # nicely if kept open across a fork -- irrelevant here (no multiprocessing)
-    # but it's a one-line cost and a safe habit.
+    # re-open the memmap each call rather than caching it - matters more for a
+    # real dataset than this one, but it's a one-line cost either way
     def get_batch(split: str):
         path = os.path.join(DATA_DIR, "train.bin" if split == "train" else "val.bin")
         data = np.memmap(path, dtype=np.uint16, mode="r")
@@ -114,25 +107,20 @@ def estimate_loss(model, get_batch, eval_iters: int, device: str):
 
 @torch.no_grad()
 def expert_utilization(model, get_batch, n_experts: int, top_k: int, eval_iters: int = 10):
-    """Step 2 sanity check (becomes the real logging target in Step 3/4):
-    how many times does each expert get selected across a handful of val
-    batches? A perfectly balanced router would pick each expert
-    (top_k / n_experts) of the time; with no load-balancing loss yet, don't
-    be surprised if this is already uneven -- that's the exact motivation
-    for Step 3.
-    """
+    """How often each expert gets picked, across a handful of val batches.
+    Balanced routing should give ~top_k/n_experts per expert."""
     model.eval()
     counts = torch.zeros(n_experts)
     total_selections = 0
     for _ in range(eval_iters):
         x, _ = get_batch("val")
         _, _, router_logits_list = model(x)
-        for router_logits in router_logits_list:  # one per MoE block
-            topk = router_logits.topk(top_k, dim=-1).indices.cpu()  # (N, top_k); move to CPU before bincount/accumulation
+        for router_logits in router_logits_list:
+            topk = router_logits.topk(top_k, dim=-1).indices.cpu()  # move to CPU before bincount
             counts += torch.bincount(topk.flatten(), minlength=n_experts).float()
             total_selections += topk.numel()
     model.train()
-    return (counts / max(total_selections, 1)).tolist()  # fraction of selections per expert
+    return (counts / max(total_selections, 1)).tolist()
 
 
 def main():
@@ -205,11 +193,11 @@ def main():
             val_ppl = float(np.exp(losses["val"]))
             log_entry = {
                 "step": step,
-                "train_loss": losses["train"],  # pure cross-entropy (estimate_loss never adds aux/z loss)
+                "train_loss": losses["train"],  # pure cross-entropy, no aux/z terms
                 "val_loss": losses["val"],
                 "val_ppl": val_ppl,
                 "lr": lr,
-                "aux_loss": aux_loss.item(),  # from the most recent training step, logged separately per the spec
+                "aux_loss": aux_loss.item(),  # from the most recent training step
                 "z_loss": z_loss.item(),
             }
             eval_line = f"  eval: train_loss {losses['train']:.4f} | val_loss {losses['val']:.4f} | val_ppl {val_ppl:.2f}"
