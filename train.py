@@ -96,11 +96,34 @@ def estimate_loss(model, get_batch, eval_iters: int, device: str):
         losses = torch.zeros(eval_iters)
         for i in range(eval_iters):
             x, y = get_batch(split)
-            _, loss = model(x, y)
+            _, loss, _ = model(x, y)
             losses[i] = loss.item()
         out[split] = losses.mean().item()
     model.train()
     return out
+
+
+@torch.no_grad()
+def expert_utilization(model, get_batch, n_experts: int, top_k: int, eval_iters: int = 10):
+    """Step 2 sanity check (becomes the real logging target in Step 3/4):
+    how many times does each expert get selected across a handful of val
+    batches? A perfectly balanced router would pick each expert
+    (top_k / n_experts) of the time; with no load-balancing loss yet, don't
+    be surprised if this is already uneven -- that's the exact motivation
+    for Step 3.
+    """
+    model.eval()
+    counts = torch.zeros(n_experts)
+    total_selections = 0
+    for _ in range(eval_iters):
+        x, _ = get_batch("val")
+        _, _, router_logits_list = model(x)
+        for router_logits in router_logits_list:  # one per MoE block
+            topk = router_logits.topk(top_k, dim=-1).indices.cpu()  # (N, top_k); move to CPU before bincount/accumulation
+            counts += torch.bincount(topk.flatten(), minlength=n_experts).float()
+            total_selections += topk.numel()
+    model.train()
+    return (counts / max(total_selections, 1)).tolist()  # fraction of selections per expert
 
 
 def main():
@@ -148,7 +171,7 @@ def main():
             group["lr"] = lr
 
         x, y = get_batch("train")
-        _, loss = model(x, y)
+        _, loss, _ = model(x, y)  # router_logits ignored for the loss until Step 3
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -161,19 +184,20 @@ def main():
         if step % args.eval_interval == 0 or step == args.max_steps - 1:
             losses = estimate_loss(model, get_batch, args.eval_iters, device)
             val_ppl = float(np.exp(losses["val"]))
-            print(f"  eval: train_loss {losses['train']:.4f} | val_loss {losses['val']:.4f} | val_ppl {val_ppl:.2f}")
-            log_file.write(
-                json.dumps(
-                    {
-                        "step": step,
-                        "train_loss": losses["train"],
-                        "val_loss": losses["val"],
-                        "val_ppl": val_ppl,
-                        "lr": lr,
-                    }
-                )
-                + "\n"
-            )
+            log_entry = {
+                "step": step,
+                "train_loss": losses["train"],
+                "val_loss": losses["val"],
+                "val_ppl": val_ppl,
+                "lr": lr,
+            }
+            eval_line = f"  eval: train_loss {losses['train']:.4f} | val_loss {losses['val']:.4f} | val_ppl {val_ppl:.2f}"
+            if config.use_moe:
+                util = expert_utilization(model, get_batch, config.n_experts, config.top_k)
+                log_entry["expert_utilization"] = util
+                eval_line += " | expert util: " + ", ".join(f"{u:.2f}" for u in util)
+            print(eval_line)
+            log_file.write(json.dumps(log_entry) + "\n")
             log_file.flush()
 
     log_file.close()

@@ -10,15 +10,18 @@ clean residual stream -- the input to each sublayer is normalized, but the
 residual addition itself is never normalized away, which makes deep stacks
 much easier to train than the original post-norm Transformer.
 
-Step 1: FFN is always the dense MLP from mlp.py (config.use_moe is ignored
-here for now). Step 2 will add the MoE branch.
+Step 2: when config.use_moe is True, the FFN sublayer is a sparse MoE layer
+instead of the dense MLP (model/moe.py). Since the MoE layer also needs to
+report its router logits (for Step 3's load-balancing/z-loss and for expert
+utilization logging), Block.forward now always returns a (x, router_logits)
+pair -- router_logits is simply None for a dense block.
 """
 import torch
 import torch.nn as nn
 
 from .attention import CausalSelfAttention
 from .config import GPTConfig
-from .mlp import build_dense_ffn
+from .moe import build_ffn
 from .norm import RMSNorm
 
 
@@ -28,9 +31,15 @@ class Block(nn.Module):
         self.attn_norm = RMSNorm(config.d_model)
         self.attn = CausalSelfAttention(config)
         self.ffn_norm = RMSNorm(config.d_model)
-        self.ffn = build_dense_ffn(config)
+        self.use_moe = config.use_moe
+        self.ffn = build_ffn(config)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor):
         x = x + self.attn(self.attn_norm(x))
-        x = x + self.ffn(self.ffn_norm(x))
-        return x
+        normed = self.ffn_norm(x)
+        if self.use_moe:
+            ffn_out, router_logits = self.ffn(normed)
+        else:
+            ffn_out, router_logits = self.ffn(normed), None
+        x = x + ffn_out
+        return x, router_logits

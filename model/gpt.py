@@ -57,18 +57,26 @@ class GPT(nn.Module):
         """
         idx: (B, T) token ids
         targets: (B, T) token ids shifted by one, or None for inference.
-        Returns (logits, loss) -- loss is None if targets is None.
+        Returns (logits, loss, router_logits_list):
+          - loss is None if targets is None.
+          - router_logits_list is a list of (B*T, n_experts) tensors, one per
+            MoE block (empty list if config.use_moe is False). Step 1 code
+            calling this can just ignore the third return value; Step 3 uses
+            it to compute the load-balancing and z-losses.
         """
         x = self.token_emb(idx)  # (B, T, d_model)
+        router_logits_list = []
         for block in self.blocks:
-            x = block(x)
+            x, router_logits = block(x)
+            if router_logits is not None:
+                router_logits_list.append(router_logits)
         x = self.final_norm(x)
         logits = self.lm_head(x)  # (B, T, vocab_size)
 
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-        return logits, loss
+        return logits, loss, router_logits_list
 
     @torch.no_grad()
     def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0, top_k: int | None = None):
@@ -76,7 +84,7 @@ class GPT(nn.Module):
         self.eval()
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -self.config.context_length :]  # RoPE cache only covers context_length positions
-            logits, _ = self(idx_cond)
+            logits, _, _ = self(idx_cond)
             logits = logits[:, -1, :] / max(temperature, 1e-6)  # only need the next-token distribution
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
