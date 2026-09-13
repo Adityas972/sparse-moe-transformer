@@ -4,8 +4,8 @@ A small decoder-only GPT-style transformer built up incrementally:
 
 1. **Dense baseline** -- causal self-attention with RoPE, pre-RMSNorm, dense FFN. (done)
 2. **Sparse MoE layer** -- replace the FFN with 8 experts, top-2 routing. (done)
-3. **Load balancing** -- Switch-style auxiliary loss + router z-loss, expert utilization logging. (next)
-4. **Ablation** -- train with/without the load-balancing loss and compare expert utilization histograms (demonstrates expert collapse).
+3. **Load balancing** -- Switch-style auxiliary loss + router z-loss, expert utilization logging. (done)
+4. **Ablation** -- train with/without the load-balancing loss and compare expert utilization histograms.
 
 ## Setup
 
@@ -85,3 +85,45 @@ load-balancing pressure and much more capacity, the MoE model overfits the small
 the rest of training: `[0.09, 0.13, 0.11, 0.10, 0.11, 0.17, 0.12, 0.16]` (ideal balanced = 0.125 each)
 -- experts 5 and 7 consistently get ~1.8x the traffic of expert 0. This is the baseline Step 4's
 ablation will compare against.
+
+## Step 3: load-balancing loss + router z-loss
+
+```bash
+python train.py --use_moe --aux_loss_weight 0.01 --out_dir checkpoints/moe_with_aux
+```
+
+`model/moe.py::compute_aux_losses` adds two terms, computed per MoE layer from that layer's
+`router_logits` and then averaged across layers:
+
+- **Load-balancing loss** (Switch Transformer, generalized top-1 -> top-k): for each expert `e`,
+  `f_e` = fraction of tokens with `e` among their top-k picks (hard, non-differentiable), `P_e` =
+  average router softmax probability on `e` (differentiable). `aux_loss = n_experts * sum_e(f_e * P_e)`.
+  Gradient only flows through `P_e`, so minimizing this pushes down the router's probability on
+  experts that are already over-selected. At perfect uniform routing this evaluates to `top_k` (not
+  `1` as in the original top-1 paper -- the scaling constant carries over but the "balanced" value
+  shifts with top_k; what matters is it's still minimized at uniform routing).
+- **Router z-loss** (ST-MoE): `mean(logsumexp(router_logits)^2)`, keeps router logits from growing
+  unbounded (which would otherwise make routing increasingly overconfident and fight the balancing
+  loss). Used at its always-on recommended coefficient, `z_loss_weight=0.001`, in every MoE run from
+  here on -- only `aux_loss_weight` is the ablation variable in Step 4.
+
+Sanity check at initialization (random router, effectively uniform): `aux_loss=2.2022` (theoretical
+minimum for top_k=2 is exactly 2.0) and `z_loss=4.6755` (`log(8)^2 ≈ 4.32` for near-zero logits over
+8 experts) -- both match theory closely, confirming the formulas are implemented correctly before
+looking at any training curves.
+
+Total loss is now `cross_entropy + aux_loss_weight * aux_loss + z_loss_weight * z_loss`; all three
+components are logged separately (console + `train_log.jsonl`) specifically so they can be compared
+across the Step 4 ablation.
+
+## Step 4: ablation (with vs. without load balancing)
+
+```bash
+python ablation.py                    # trains both configs (~15 min each on MPS), then plots
+python ablation.py --skip_training    # just re-plot existing runs under checkpoints/ablation_*
+```
+
+Trains two MoE models identically (same seed, same `z_loss_weight=0.001`) except `aux_loss_weight`:
+`0.0` vs `0.01`. Produces `expert_utilization_ablation.png` (final per-expert selection fraction,
+side by side, with a dashed line at the ideal uniform `1/8`) and `expert_utilization_spread_over_time.png`
+(max-min utilization gap across training, for both runs).

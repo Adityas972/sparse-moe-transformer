@@ -1,15 +1,23 @@
 """
-Step 1 training script: trains the dense (non-MoE) GPT on TinyShakespeare.
+Training script: dense GPT (default) or sparse MoE GPT (--use_moe) on
+character-level TinyShakespeare.
 
-Defaults are chosen to be comfortable on a laptop CPU: context_length=128,
-batch_size=64, 3000 steps finishes in a few minutes on CPU and already
-produces recognizably-Shakespeare-ish character sequences. If a GPU/MPS
-device is available it's used automatically (strictly faster, same numbers).
+Defaults are chosen to be comfortable on a laptop CPU/MPS: context_length=128,
+batch_size=64, 3000 steps finishes in a few minutes and already produces
+recognizably-Shakespeare-ish character sequences.
 
 Usage:
     python data/prepare_data.py     # one-time: download + tokenize
-    python train.py                 # train with defaults
-    python train.py --max_steps 5000 --out_dir checkpoints/longer_run
+    python train.py                                                     # Step 1: dense baseline
+    python train.py --use_moe --aux_loss_weight 0.0  --out_dir checkpoints/moe_no_aux   # Step 2 behavior
+    python train.py --use_moe --aux_loss_weight 0.01 --out_dir checkpoints/moe_with_aux # Step 3: load-balanced
+
+When --use_moe is set, the total loss is:
+    loss = cross_entropy + aux_loss_weight * aux_loss + z_loss_weight * z_loss
+(aux_loss and z_loss are computed in model/moe.py::compute_aux_losses). All
+three components are logged separately -- see the printed eval lines and
+train_log.jsonl -- specifically so aux_loss_weight=0 vs 0.01 runs can be
+compared (that's Step 4, ablation.py).
 """
 import argparse
 import json
@@ -21,6 +29,7 @@ import numpy as np
 import torch
 
 from model import GPT, GPTConfig
+from model.moe import compute_aux_losses
 from utils.scheduler import get_lr
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
@@ -43,7 +52,7 @@ def parse_args():
     p.add_argument("--top_k", type=int, default=2)
     p.add_argument("--expert_d_ff", type=int, default=512)
     p.add_argument("--aux_loss_weight", type=float, default=0.0)
-    p.add_argument("--z_loss_weight", type=float, default=0.0)
+    p.add_argument("--z_loss_weight", type=float, default=0.001)  # ST-MoE's recommended coefficient
     # training
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--max_steps", type=int, default=3000)
@@ -171,7 +180,13 @@ def main():
             group["lr"] = lr
 
         x, y = get_batch("train")
-        _, loss, _ = model(x, y)  # router_logits ignored for the loss until Step 3
+        _, ce_loss, router_logits_list = model(x, y)
+
+        if config.use_moe:
+            aux_loss, z_loss = compute_aux_losses(router_logits_list, config.n_experts, config.top_k)
+        else:
+            aux_loss = z_loss = torch.tensor(0.0, device=device)
+        loss = ce_loss + args.aux_loss_weight * aux_loss + args.z_loss_weight * z_loss
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -179,17 +194,23 @@ def main():
         optimizer.step()
 
         if step % args.log_interval == 0:
-            print(f"step {step:5d} | loss {loss.item():.4f} | lr {lr:.2e} | {time.time()-t0:.1f}s")
+            msg = f"step {step:5d} | loss {loss.item():.4f} (ce {ce_loss.item():.4f}"
+            if config.use_moe:
+                msg += f" + aux {aux_loss.item():.4f} + z {z_loss.item():.4f}"
+            msg += f") | lr {lr:.2e} | {time.time()-t0:.1f}s"
+            print(msg)
 
         if step % args.eval_interval == 0 or step == args.max_steps - 1:
             losses = estimate_loss(model, get_batch, args.eval_iters, device)
             val_ppl = float(np.exp(losses["val"]))
             log_entry = {
                 "step": step,
-                "train_loss": losses["train"],
+                "train_loss": losses["train"],  # pure cross-entropy (estimate_loss never adds aux/z loss)
                 "val_loss": losses["val"],
                 "val_ppl": val_ppl,
                 "lr": lr,
+                "aux_loss": aux_loss.item(),  # from the most recent training step, logged separately per the spec
+                "z_loss": z_loss.item(),
             }
             eval_line = f"  eval: train_loss {losses['train']:.4f} | val_loss {losses['val']:.4f} | val_ppl {val_ppl:.2f}"
             if config.use_moe:

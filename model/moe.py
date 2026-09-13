@@ -100,3 +100,62 @@ def build_ffn(config: GPTConfig):
     from .mlp import build_dense_ffn
 
     return build_dense_ffn(config)
+
+
+def compute_aux_losses(router_logits_list: list[torch.Tensor], n_experts: int, top_k: int):
+    """
+    Step 3: Switch Transformer-style load-balancing loss, generalized from
+    top-1 to top-k, plus the ST-MoE router z-loss. Computed per MoE layer,
+    then averaged across layers (routing is decided independently at each
+    layer, so a layer that's perfectly balanced shouldn't be allowed to
+    "hide" a badly imbalanced one by averaging their raw logits together --
+    only the final scalar losses are averaged).
+
+    Returns (aux_loss, z_loss), both scalars, zero if there are no MoE layers.
+
+    --- Load-balancing loss ---
+    For each expert e:
+      f_e = fraction of tokens that have e among their top-k choices
+            (a hard, non-differentiable count -- just "how often was e picked")
+      P_e = average router softmax probability assigned to e
+            (differentiable -- this is what the router's weights actually control)
+    aux_loss = n_experts * sum_e (f_e * P_e)
+
+    Minimizing this pushes down P_e for experts that are already being
+    over-selected (high f_e), which is what makes the router prefer
+    under-used experts more over training -- f_e itself carries no gradient
+    (it comes from a hard topk), so all the gradient signal flows through
+    P_e. At perfectly uniform routing, f_e = top_k/n_experts and
+    P_e = 1/n_experts for every expert, giving aux_loss = top_k (not 1 -- the
+    "n_experts *" scaling constant comes from the original top-1 paper,
+    where uniform routing gives exactly 1; generalizing to top-k shifts that
+    minimum to top_k, but the important property -- minimized at uniform
+    routing -- still holds, which is all that's actually needed).
+
+    --- Router z-loss (Zoph et al., ST-MoE) ---
+    Penalizes large router logits via mean(logsumexp(logits)^2). Router
+    logits that grow large make the softmax increasingly peaked/confident,
+    which (a) can destabilize training (large gradients through softmax)
+    and (b) works against the load-balancing loss by making routing more
+    committed to fewer experts. This term just keeps logits in a reasonable
+    range without otherwise constraining what the router learns.
+    """
+    if not router_logits_list:
+        zero = torch.tensor(0.0)
+        return zero, zero
+
+    aux_losses = []
+    z_losses = []
+    for router_logits in router_logits_list:  # (N, n_experts), one per MoE layer
+        router_logits = router_logits.float()
+        router_probs = F.softmax(router_logits, dim=-1)  # (N, E)
+
+        _, topk_indices = router_probs.topk(top_k, dim=-1)  # (N, top_k)
+        one_hot = F.one_hot(topk_indices, n_experts).float()  # (N, top_k, E)
+        f = one_hot.sum(dim=1).mean(dim=0)  # (E,) -- P(e in this token's top-k), averaged over tokens
+        P = router_probs.mean(dim=0)  # (E,) -- average router probability mass on e
+
+        aux_losses.append(n_experts * (f * P).sum())
+        z_losses.append(torch.logsumexp(router_logits, dim=-1).pow(2).mean())
+
+    return torch.stack(aux_losses).mean(), torch.stack(z_losses).mean()
